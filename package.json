@@ -1,6 +1,6 @@
 {
   "name": "wezterm-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "mcp server for wezterm ",
   "homepage": "https://github.com/hiraishikentaro/wezterm-mcp#readme",
   "repository": {
@@ -23,13 +23,13 @@
     "watch": "tsc --watch",
     "prepare": "npm run build",
     "inspector": "npx @modelcontextprotocol/inspector build/index.js",
-    "test": "jest",
-    "test:watch": "jest --watch",
-    "test:coverage": "jest --coverage"
+    "test": "node --experimental-vm-modules ./node_modules/jest/bin/jest.js",
+    "test:watch": "node --experimental-vm-modules ./node_modules/jest/bin/jest.js --watch",
+    "test:coverage": "node --experimental-vm-modules ./node_modules/jest/bin/jest.js --coverage"
   },
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.8.0"
+    "@modelcontextprotocol/sdk": "^1.28.0"
   },
   "devDependencies": {
     "@types/node": "^22.15.23",

@@ -21,6 +21,10 @@ export default {
     ],
   },
 
+  moduleNameMapper: {
+    "^(\\.{1,2}/.*)\\.js$": "$1",
+  },
+
   // カバレッジ設定
   collectCoverageFrom: [
     "src/**/*.ts",

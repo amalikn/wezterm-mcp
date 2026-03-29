@@ -1,164 +1,163 @@
-import { exec } from "child_process";
-import { promisify } from "util";
 import WeztermExecutor from "../src/wezterm_executor";
+import { RuntimePolicy } from "../src/config";
 
-// child_processモジュールをモック化
-jest.mock("child_process");
-const mockedExec = jest.mocked(exec);
+type CliCall = {
+  args: string[];
+  options: { timeoutMs: number; maxOutputBytes: number };
+};
+
+function createPolicy(overrides?: Partial<RuntimePolicy>): RuntimePolicy {
+  return {
+    weztermCliPath: "wezterm",
+    writeEnabled: true,
+    controlEnabled: false,
+    allowedPanes: new Set<number>(),
+    allowedCommands: [],
+    defaultReadLines: 50,
+    maxLines: 500,
+    timeoutMs: 30_000,
+    maxOutputBytes: 1024 * 1024,
+    auditLogPath: "/tmp/wezterm-mcp-test-audit.log",
+    ...overrides,
+  };
+}
 
 describe("WeztermExecutor", () => {
-  let executor: WeztermExecutor;
+  let calls: CliCall[];
 
   beforeEach(() => {
-    executor = new WeztermExecutor();
-    jest.clearAllMocks();
+    calls = [];
   });
 
+  function createExecutor(
+    policyOverrides?: Partial<RuntimePolicy>,
+    implementation?: (args: string[]) => Promise<{ stdout: string; stderr: string }>
+  ): WeztermExecutor {
+    const policy = createPolicy(policyOverrides);
+    return new WeztermExecutor(policy, async (_weztermCliPath, args, options) => {
+      calls.push({ args, options });
+      if (implementation) {
+        return implementation(args);
+      }
+      return { stdout: "", stderr: "" };
+    });
+  }
+
   describe("writeToTerminal", () => {
-    it("正常にコマンドを送信できること", async () => {
-      // モックの設定
-      const mockPaneInfo = "pane_id=1 active=true";
-      mockedExec.mockImplementation((command: string, callback: any) => {
-        if (command.includes("list")) {
-          callback(null, { stdout: mockPaneInfo, stderr: "" });
-        } else if (command.includes("send-text")) {
-          callback(null, { stdout: "", stderr: "" });
-        }
-        return {} as any; // ChildProcessのモック
+    it("sends text using argv-safe wezterm cli arguments", async () => {
+      const executor = createExecutor();
+
+      const result = await executor.writeToTerminal('echo "hello"');
+
+      expect(result.isError).toBeUndefined();
+      expect(result.content[0].text).toContain('Command sent to WezTerm: echo "hello"');
+      expect(calls).toHaveLength(1);
+      expect(calls[0].args).toEqual(["send-text", "--no-paste", 'echo "hello"\n']);
+      expect(calls[0].options.timeoutMs).toBe(30_000);
+    });
+
+    it("fails closed when write policy is disabled", async () => {
+      const executor = createExecutor({ writeEnabled: false });
+
+      const result = await executor.writeToTerminal("pwd");
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("WEZTERM_MCP_ENABLE_WRITE=true");
+      expect(calls).toHaveLength(0);
+    });
+
+    it("rejects commands outside the allowlist", async () => {
+      const executor = createExecutor({
+        allowedCommands: [{ raw: "pwd" }],
+      });
+
+      const result = await executor.writeToTerminal("ls");
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("WEZTERM_MCP_ALLOWED_COMMANDS");
+      expect(calls).toHaveLength(0);
+    });
+
+    it("returns CLI failures as MCP errors", async () => {
+      const executor = createExecutor(undefined, async () => {
+        throw new Error("WezTerm not running");
       });
 
       const result = await executor.writeToTerminal('echo "hello"');
 
-      expect(result.content).toHaveLength(1);
-      expect(result.content[0].type).toBe("text");
-      expect(result.content[0].text).toContain(
-        'Command sent to WezTerm: echo "hello"'
-      );
-      expect(result.content[0].text).toContain(mockPaneInfo);
-    });
-
-    it("特殊文字を含むコマンドを正しくエスケープできること", async () => {
-      const mockPaneInfo = "pane_id=1 active=true";
-      mockedExec.mockImplementation((command: string, callback: any) => {
-        if (command.includes("list")) {
-          callback(null, { stdout: mockPaneInfo, stderr: "" });
-        } else if (command.includes("send-text")) {
-          // エスケープされたコマンドが正しく渡されているかチェック
-          expect(command).toContain("'\"'\"'");
-          callback(null, { stdout: "", stderr: "" });
-        }
-        return {} as any; // ChildProcessのモック
-      });
-
-      await executor.writeToTerminal("echo 'hello world'");
-    });
-
-    it("エラーが発生した場合にエラーメッセージを返すこと", async () => {
-      mockedExec.mockImplementation((command: string, callback: any) => {
-        callback(new Error("WezTerm not running"), null);
-        return {} as any; // ChildProcessのモック
-      });
-
-      const result = await executor.writeToTerminal('echo "hello"');
-
-      expect(result.content).toHaveLength(1);
-      expect(result.content[0].type).toBe("text");
-      expect(result.content[0].text).toContain("Failed to write to terminal");
+      expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("WezTerm not running");
     });
   });
 
   describe("writeToSpecificPane", () => {
-    it("指定されたペインにコマンドを送信できること", async () => {
-      mockedExec.mockImplementation((command: string, callback: any) => {
-        expect(command).toContain("--pane-id 123");
-        callback(null, { stdout: "", stderr: "" });
-        return {} as any; // ChildProcessのモック
-      });
+    it("sends text to the requested pane", async () => {
+      const executor = createExecutor();
 
       const result = await executor.writeToSpecificPane("ls -la", 123);
 
-      expect(result.content).toHaveLength(1);
-      expect(result.content[0].type).toBe("text");
       expect(result.content[0].text).toBe("Command sent to pane 123: ls -la");
+      expect(calls[0].args).toEqual([
+        "send-text",
+        "--pane-id",
+        "123",
+        "--no-paste",
+        "ls -la\n",
+      ]);
     });
 
-    it("ペイン指定でエラーが発生した場合にエラーメッセージを返すこと", async () => {
-      mockedExec.mockImplementation((command: string, callback: any) => {
-        callback(new Error("Pane not found"), null);
-        return {} as any; // ChildProcessのモック
-      });
+    it("rejects pane ids outside the allowlist", async () => {
+      const executor = createExecutor({ allowedPanes: new Set([7]) });
 
-      const result = await executor.writeToSpecificPane("ls", 999);
+      const result = await executor.writeToSpecificPane("ls", 9);
 
-      expect(result.content).toHaveLength(1);
-      expect(result.content[0].type).toBe("text");
-      expect(result.content[0].text).toContain("Failed to write to pane 999");
-      expect(result.content[0].text).toContain("Pane not found");
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("not in WEZTERM_MCP_ALLOWED_PANES");
+      expect(calls).toHaveLength(0);
+    });
+
+    it("rejects invalid pane ids", async () => {
+      const executor = createExecutor();
+
+      const result = await executor.writeToSpecificPane("ls", -1);
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Pane ID must be a non-negative integer");
     });
   });
 
   describe("listPanes", () => {
-    it("ペイン一覧を正常に取得できること", async () => {
-      const mockPaneList = `pane_id=1 active=true title="Terminal"
-pane_id=2 active=false title="Editor"`;
-
-      mockedExec.mockImplementation((command: string, callback: any) => {
-        expect(command).toContain("wezterm cli list");
-        callback(null, { stdout: mockPaneList, stderr: "" });
-        return {} as any; // ChildProcessのモック
-      });
+    it("returns pane output", async () => {
+      const paneList = `pane_id=1 active=true\npane_id=2 active=false`;
+      const executor = createExecutor(undefined, async () => ({
+        stdout: paneList,
+        stderr: "",
+      }));
 
       const result = await executor.listPanes();
 
-      expect(result.content).toHaveLength(1);
-      expect(result.content[0].type).toBe("text");
-      expect(result.content[0].text).toBe(mockPaneList);
-    });
-
-    it("ペイン一覧取得でエラーが発生した場合にエラーメッセージを返すこと", async () => {
-      mockedExec.mockImplementation((command: string, callback: any) => {
-        callback(new Error("Connection failed"), null);
-        return {} as any; // ChildProcessのモック
-      });
-
-      const result = await executor.listPanes();
-
-      expect(result.content).toHaveLength(1);
-      expect(result.content[0].type).toBe("text");
-      expect(result.content[0].text).toContain("Failed to list panes");
-      expect(result.content[0].text).toContain("Connection failed");
+      expect(result.content[0].text).toBe(paneList);
+      expect(calls[0].args).toEqual(["list"]);
     });
   });
 
   describe("switchPane", () => {
-    it("指定されたペインに切り替えできること", async () => {
-      mockedExec.mockImplementation((command: string, callback: any) => {
-        expect(command).toContain("activate-pane --pane-id 42");
-        callback(null, { stdout: "", stderr: "" });
-        return {} as any; // ChildProcessのモック
-      });
+    it("activates the requested pane", async () => {
+      const executor = createExecutor();
 
       const result = await executor.switchPane(42);
 
-      expect(result.content).toHaveLength(1);
-      expect(result.content[0].type).toBe("text");
       expect(result.content[0].text).toBe("Switched to pane 42");
+      expect(calls[0].args).toEqual(["activate-pane", "--pane-id", "42"]);
     });
 
-    it("存在しないペインに切り替えようとした場合にエラーメッセージを返すこと", async () => {
-      mockedExec.mockImplementation((command: string, callback: any) => {
-        callback(new Error("Pane does not exist"), null);
-        return {} as any; // ChildProcessのモック
-      });
+    it("rejects invalid pane ids", async () => {
+      const executor = createExecutor();
 
-      const result = await executor.switchPane(999);
+      const result = await executor.switchPane(Number.NaN);
 
-      expect(result.content).toHaveLength(1);
-      expect(result.content[0].type).toBe("text");
-      expect(result.content[0].text).toContain("Failed to switch pane");
-      expect(result.content[0].text).toContain("Pane does not exist");
-      expect(result.content[0].text).toContain("pane ID 999");
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Pane ID must be a non-negative integer");
     });
   });
 });

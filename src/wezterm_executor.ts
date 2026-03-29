@@ -1,123 +1,183 @@
-import { exec } from "child_process";
-import { promisify } from "util";
+import AuditLogger from "./audit_logger.js";
+import { RuntimePolicy } from "./config.js";
+import {
+  PolicyError,
+  enforceWritePolicy,
+  getRuntimePolicy,
+  validateCommand,
+  validatePaneId,
+} from "./policy.js";
+import { McpResponse, getErrorMessage, textResponse } from "./types.js";
+import { CliResult, executeWeztermCli } from "./wezterm_cli.js";
 
-const execAsync = promisify(exec);
+type CliExecutor = (
+  weztermCliPath: string,
+  args: string[],
+  options: { timeoutMs: number; maxOutputBytes: number }
+) => Promise<CliResult>;
 
 export default class WeztermExecutor {
-  private weztermCli: string;
+  private readonly logger: AuditLogger;
 
-  constructor() {
-    this.weztermCli = "wezterm cli";
+  constructor(
+    private readonly policy: RuntimePolicy = getRuntimePolicy(),
+    private readonly runCli: CliExecutor = executeWeztermCli
+  ) {
+    this.logger = new AuditLogger(this.policy.auditLogPath);
   }
 
-  async writeToTerminal(command: string): Promise<{ content: any[] }> {
-    try {
-      // 現在のアクティブペインを確認
-      const { stdout: paneInfo } = await execAsync(`${this.weztermCli} list`);
+  private async execute(args: string[]): Promise<CliResult> {
+    return this.runCli(this.policy.weztermCliPath, args, {
+      timeoutMs: this.policy.timeoutMs,
+      maxOutputBytes: this.policy.maxOutputBytes,
+    });
+  }
 
-      // WezTerm CLIを使用してアクティブなペインにテキストを送信
-      // コマンドと改行を一緒に送信して確実に実行
-      const escapedCommand = command.replace(/'/g, "'\"'\"'");
-      await execAsync(
-        `${this.weztermCli} send-text --no-paste '${escapedCommand}\n'`
+  async writeToTerminal(commandInput: unknown): Promise<McpResponse> {
+    const startedAt = Date.now();
+
+    try {
+      const command = validateCommand(commandInput);
+      await enforceWritePolicy(
+        this.policy,
+        this.logger,
+        "write_to_terminal",
+        command
       );
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Command sent to WezTerm: ${command}\n\nCurrent panes:\n${paneInfo}`,
-          },
-        ],
-      };
-    } catch (error: any) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Failed to write to terminal: ${error.message}\nMake sure WezTerm is running and the mux server is enabled.`,
-          },
-        ],
-      };
+      await this.execute(["send-text", "--no-paste", `${command}\n`]);
+      await this.logger.record({
+        tool: "write_to_terminal",
+        status: "allowed",
+        durationMs: Date.now() - startedAt,
+        details: { command },
+      });
+
+      return textResponse(`Command sent to WezTerm: ${command}`);
+    } catch (error) {
+      await this.logger.record({
+        tool: "write_to_terminal",
+        status: error instanceof PolicyError ? "denied" : "error",
+        durationMs: Date.now() - startedAt,
+        details: { message: getErrorMessage(error) },
+      });
+      return textResponse(
+        `Failed to write to terminal: ${getErrorMessage(error)}\nMake sure WezTerm is running and the mux server is enabled.`,
+        { isError: true }
+      );
     }
   }
 
   async writeToSpecificPane(
-    command: string,
-    paneId: number
-  ): Promise<{ content: any[] }> {
+    commandInput: unknown,
+    paneIdInput: unknown
+  ): Promise<McpResponse> {
+    const startedAt = Date.now();
+
     try {
-      // 指定されたペインにコマンドを送信
-      const escapedCommand = command.replace(/'/g, "'\"'\"'");
-      await execAsync(
-        `${this.weztermCli} send-text --pane-id ${paneId} --no-paste '${escapedCommand}\n'`
+      const command = validateCommand(commandInput);
+      const paneId = Number(paneIdInput);
+      validatePaneId(paneId);
+      await enforceWritePolicy(
+        this.policy,
+        this.logger,
+        "write_to_specific_pane",
+        command,
+        paneId
       );
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Command sent to pane ${paneId}: ${command}`,
-          },
-        ],
-      };
-    } catch (error: any) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Failed to write to pane ${paneId}: ${error.message}`,
-          },
-        ],
-      };
+      await this.execute([
+        "send-text",
+        "--pane-id",
+        String(paneId),
+        "--no-paste",
+        `${command}\n`,
+      ]);
+      await this.logger.record({
+        tool: "write_to_specific_pane",
+        status: "allowed",
+        durationMs: Date.now() - startedAt,
+        paneId,
+        details: { command },
+      });
+
+      return textResponse(`Command sent to pane ${paneId}: ${command}`);
+    } catch (error) {
+      const paneId =
+        typeof paneIdInput === "number" || typeof paneIdInput === "string"
+          ? Number(paneIdInput)
+          : undefined;
+      await this.logger.record({
+        tool: "write_to_specific_pane",
+        status: error instanceof PolicyError ? "denied" : "error",
+        durationMs: Date.now() - startedAt,
+        paneId: Number.isFinite(paneId) ? paneId : undefined,
+        details: { message: getErrorMessage(error) },
+      });
+      return textResponse(
+        `Failed to write to pane ${String(paneIdInput)}: ${getErrorMessage(error)}`,
+        { isError: true }
+      );
     }
   }
 
-  async listPanes(): Promise<{ content: any[] }> {
+  async listPanes(): Promise<McpResponse> {
+    const startedAt = Date.now();
+
     try {
-      // 正しいコマンドは 'list' です
-      const { stdout } = await execAsync(`${this.weztermCli} list`);
-      return {
-        content: [
-          {
-            type: "text",
-            text: stdout,
-          },
-        ],
-      };
-    } catch (error: any) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Failed to list panes: ${error.message}\nMake sure WezTerm is running and the mux server is enabled.`,
-          },
-        ],
-      };
+      const { stdout } = await this.execute(["list"]);
+      await this.logger.record({
+        tool: "list_panes",
+        status: "allowed",
+        durationMs: Date.now() - startedAt,
+      });
+      return textResponse(stdout || "(empty output)");
+    } catch (error) {
+      await this.logger.record({
+        tool: "list_panes",
+        status: "error",
+        durationMs: Date.now() - startedAt,
+        details: { message: getErrorMessage(error) },
+      });
+      return textResponse(
+        `Failed to list panes: ${getErrorMessage(error)}\nMake sure WezTerm is running and the mux server is enabled.`,
+        { isError: true }
+      );
     }
   }
 
-  async switchPane(paneId: number): Promise<{ content: any[] }> {
+  async switchPane(paneIdInput: unknown): Promise<McpResponse> {
+    const startedAt = Date.now();
+
     try {
-      // activate-paneコマンドの正しい形式を使用
-      await execAsync(`${this.weztermCli} activate-pane --pane-id ${paneId}`);
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Switched to pane ${paneId}`,
-          },
-        ],
-      };
-    } catch (error: any) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Failed to switch pane: ${error.message}\nMake sure the pane ID ${paneId} exists.`,
-          },
-        ],
-      };
+      const paneId = Number(paneIdInput);
+      validatePaneId(paneId);
+      await this.execute(["activate-pane", "--pane-id", String(paneId)]);
+      await this.logger.record({
+        tool: "switch_pane",
+        status: "allowed",
+        durationMs: Date.now() - startedAt,
+        paneId,
+      });
+      return textResponse(`Switched to pane ${paneId}`);
+    } catch (error) {
+      const paneId =
+        typeof paneIdInput === "number" || typeof paneIdInput === "string"
+          ? Number(paneIdInput)
+          : undefined;
+      await this.logger.record({
+        tool: "switch_pane",
+        status: error instanceof PolicyError ? "denied" : "error",
+        durationMs: Date.now() - startedAt,
+        paneId: Number.isFinite(paneId) ? paneId : undefined,
+        details: { message: getErrorMessage(error) },
+      });
+      return textResponse(
+        `Failed to switch pane: ${getErrorMessage(error)}\nMake sure the pane ID ${String(
+          paneIdInput
+        )} exists.`,
+        { isError: true }
+      );
     }
   }
 }

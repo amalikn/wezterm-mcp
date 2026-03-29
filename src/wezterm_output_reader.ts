@@ -1,74 +1,87 @@
-import { exec } from "child_process";
-import { promisify } from "util";
+import AuditLogger from "./audit_logger.js";
+import { RuntimePolicy } from "./config.js";
+import { getRuntimePolicy, validateReadLines } from "./policy.js";
+import { McpResponse, getErrorMessage, textResponse } from "./types.js";
+import { CliResult, executeWeztermCli } from "./wezterm_cli.js";
 
-const execAsync = promisify(exec);
+type CliExecutor = (
+  weztermCliPath: string,
+  args: string[],
+  options: { timeoutMs: number; maxOutputBytes: number }
+) => Promise<CliResult>;
 
 export default class WeztermOutputReader {
-  private weztermCli: string;
+  private readonly logger: AuditLogger;
 
-  constructor() {
-    this.weztermCli = "wezterm cli";
+  constructor(
+    private readonly policy: RuntimePolicy = getRuntimePolicy(),
+    private readonly runCli: CliExecutor = executeWeztermCli
+  ) {
+    this.logger = new AuditLogger(this.policy.auditLogPath);
   }
 
-  async readOutput(lines: number = 50): Promise<{ content: any[] }> {
+  private async execute(args: string[]): Promise<CliResult> {
+    return this.runCli(this.policy.weztermCliPath, args, {
+      timeoutMs: this.policy.timeoutMs,
+      maxOutputBytes: this.policy.maxOutputBytes,
+    });
+  }
+
+  async readOutput(linesInput?: unknown): Promise<McpResponse> {
+    const startedAt = Date.now();
+
     try {
-      let command: string;
+      const lines = validateReadLines(linesInput, this.policy);
+      const { stdout } = await this.execute([
+        "get-text",
+        "--escapes",
+        "--start-line",
+        String(-lines),
+      ]);
+      await this.logger.record({
+        tool: "read_terminal_output",
+        status: "allowed",
+        durationMs: Date.now() - startedAt,
+        details: { lines },
+      });
 
-      if (lines <= 0) {
-        // 全ての内容を取得（現在の画面のみ）
-        command = `${this.weztermCli} get-text --escapes`;
-      } else {
-        // 指定された行数分を取得（スクロールバックから）
-        const startLine = -lines;
-        command = `${this.weztermCli} get-text --escapes --start-line ${startLine}`;
-      }
-
-      const { stdout } = await execAsync(command);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: stdout || "(empty output)",
-          },
-        ],
-      };
-    } catch (error: any) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Failed to read terminal output: ${error.message}\nMake sure WezTerm is running and the mux server is enabled.\nTry running: wezterm cli list`,
-          },
-        ],
-      };
+      return textResponse(stdout || "(empty output)");
+    } catch (error) {
+      await this.logger.record({
+        tool: "read_terminal_output",
+        status: "error",
+        durationMs: Date.now() - startedAt,
+        details: { message: getErrorMessage(error) },
+      });
+      return textResponse(
+        `Failed to read terminal output: ${getErrorMessage(error)}\nMake sure WezTerm is running and the mux server is enabled.\nTry running: wezterm cli list`,
+        { isError: true }
+      );
     }
   }
 
-  // 現在の画面内容のみを取得する新しいメソッド
-  async readCurrentScreen(): Promise<{ content: any[] }> {
-    try {
-      const { stdout } = await execAsync(
-        `${this.weztermCli} get-text --escapes`
-      );
+  async readCurrentScreen(): Promise<McpResponse> {
+    const startedAt = Date.now();
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: stdout || "(empty output)",
-          },
-        ],
-      };
-    } catch (error: any) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Failed to read current screen: ${error.message}`,
-          },
-        ],
-      };
+    try {
+      const { stdout } = await this.execute(["get-text", "--escapes"]);
+      await this.logger.record({
+        tool: "read_current_screen",
+        status: "allowed",
+        durationMs: Date.now() - startedAt,
+      });
+      return textResponse(stdout || "(empty output)");
+    } catch (error) {
+      await this.logger.record({
+        tool: "read_current_screen",
+        status: "error",
+        durationMs: Date.now() - startedAt,
+        details: { message: getErrorMessage(error) },
+      });
+      return textResponse(
+        `Failed to read current screen: ${getErrorMessage(error)}`,
+        { isError: true }
+      );
     }
   }
 }
